@@ -84,28 +84,69 @@ react-dom/cjs/react-dom-client.production.js:
     "Masteron Propionate": { halfLife: 3, peakDays: 0.7, label: "Mast-P", color: "#10b981", category: "Other" },
     "Masteron Enanthate": { halfLife: 8, peakDays: 2.5, label: "Mast-E", color: "#34d399", category: "Other" }
   };
+  const pad2 = (n) => String(n).padStart(2, "0");
+  function localDT(d = /* @__PURE__ */ new Date()) {
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  }
+  function localDate(d = /* @__PURE__ */ new Date()) {
+    return localDT(d).slice(0, 10);
+  }
+  function parseDate(s) {
+    if (!s) return /* @__PURE__ */ new Date(NaN);
+    return new Date(s.length === 10 ? s + "T12:00" : s);
+  }
+  function fmtDate(s, opts) {
+    return parseDate(s).toLocaleDateString("en-US", opts || { month: "short", day: "numeric" });
+  }
+  function fmtSince(days) {
+    return days < 2 ? `${Math.round(days * 24)}h` : `${days.toFixed(1)} days`;
+  }
+  const ESTER_FRACTION = { "Testosterone Cypionate": 0.7, "Testosterone Enanthate": 0.72, "Testosterone Propionate": 0.82, "Testosterone Undecanoate": 0.63, "Testosterone Suspension": 1 };
+  const BASE_SCALE = 7;
+  const PK_CACHE = {};
+  function solveKa(ke, tmax) {
+    let lo = ke * 1.0001, hi = 500;
+    for (let i = 0; i < 80; i++) {
+      const mid = (lo + hi) / 2;
+      const f = Math.log(mid / ke) / (mid - ke);
+      if (f > tmax) lo = mid;
+      else hi = mid;
+    }
+    return (lo + hi) / 2;
+  }
+  function pkRates(name) {
+    var _a;
+    if (!PK_CACHE[name]) {
+      const p = COMPOUND_PARAMS[name] || COMPOUND_PARAMS["Testosterone Cypionate"];
+      const ke = Math.log(2) / p.halfLife;
+      PK_CACHE[name] = { ke, ka: solveKa(ke, p.peakDays), frac: (_a = ESTER_FRACTION[name]) != null ? _a : 0.7 };
+    }
+    return PK_CACHE[name];
+  }
+  function isTCompound(name) {
+    return (COMPOUND_PARAMS[name] || {}).category === "Testosterone";
+  }
   function normalizeInj(inj) {
     if (inj.compounds) return inj;
     return { ...inj, compounds: [{ name: inj.ester || "Testosterone Cypionate", dose: inj.dose || 100, concentration: 200 }] };
   }
-  function computeLevel(injections, targetDate) {
+  function computeLevel(injections, targetDate, scale = 1) {
     let total = 0;
+    const tt = +targetDate;
     injections.forEach((raw) => {
       const inj = normalizeInj(raw);
+      const t = (tt - +new Date(inj.datetime)) / 864e5;
+      if (!(t >= 0)) return;
       inj.compounds.forEach(({ name, dose }) => {
-        const params = COMPOUND_PARAMS[name] || COMPOUND_PARAMS["Testosterone Cypionate"];
-        if (params.category !== "Testosterone") return;
-        const injDate = new Date(inj.datetime);
-        const t = (targetDate - injDate) / 864e5;
-        if (t < 0) return;
-        const ke = Math.log(2) / params.halfLife;
-        const ka = Math.log(2) / params.peakDays;
-        total += dose * Math.max(0, Math.abs(ka - ke) < 1e-3 ? ke * t * Math.exp(-ke * t) : ka / (ka - ke) * (Math.exp(-ke * t) - Math.exp(-ka * t)));
+        if (!isTCompound(name)) return;
+        const r = pkRates(name);
+        const eff = (parseFloat(dose) || 0) * r.frac;
+        total += eff * (Math.abs(r.ka - r.ke) < 1e-6 ? r.ke * t * Math.exp(-r.ke * t) : r.ka / (r.ka - r.ke) * (Math.exp(-r.ke * t) - Math.exp(-r.ka * t)));
       });
     });
-    return Math.round(total * 7);
+    return Math.round(total * BASE_SCALE * scale);
   }
-  function generatePKCurve(injections) {
+  function generatePKCurve(injections, scale = 1) {
     if (!injections.length) return [];
     const now = /* @__PURE__ */ new Date();
     const earliest = new Date(Math.min(...injections.map((i) => new Date(i.datetime))));
@@ -113,9 +154,82 @@ react-dom/cjs/react-dom-client.production.js:
     const end = new Date(now.getTime() + 30 * 864e5);
     const points = [];
     for (let d = new Date(earliest); d <= end; d.setHours(d.getHours() + 6)) {
-      points.push({ time: +d, level: computeLevel(injections, d), label: d.toLocaleDateString("en-US", { month: "short", day: "numeric" }) });
+      points.push({ time: +d, level: computeLevel(injections, d, scale), label: d.toLocaleDateString("en-US", { month: "short", day: "numeric" }) });
     }
     return points;
+  }
+  function tInjections(injections) {
+    return injections.map(normalizeInj).filter((i) => i.compounds.some((c) => isTCompound(c.name) && (parseFloat(c.dose) || 0) > 0)).sort((a, b) => new Date(a.datetime) - new Date(b.datetime));
+  }
+  function labTime(lab) {
+    return lab.datetime ? new Date(lab.datetime) : /* @__PURE__ */ new Date((lab.date || localDate()) + "T08:00");
+  }
+  function analyzeLab(lab, injections) {
+    const when = labTime(lab);
+    const timeAssumed = !lab.datetime;
+    const ti = tInjections(injections);
+    const prior = ti.filter((i) => new Date(i.datetime) <= when);
+    if (!prior.length) return { when, timeAssumed, status: "none" };
+    const last = prior[prior.length - 1];
+    const daysSince = (when - new Date(last.datetime)) / 864e5;
+    const gaps = [];
+    for (let i = Math.max(1, prior.length - 5); i < prior.length; i++) {
+      const g = (new Date(prior[i].datetime) - new Date(prior[i - 1].datetime)) / 864e5;
+      if (g > 0.25) gaps.push(g);
+    }
+    gaps.sort((a, b) => a - b);
+    const interval = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 7;
+    const tmax = Math.max(...last.compounds.filter((c) => isTCompound(c.name)).map((c) => (COMPOUND_PARAMS[c.name] || {}).peakDays || 2));
+    const frac = daysSince / interval;
+    const phase = frac >= 0.85 ? "trough" : daysSince <= 1.5 * tmax ? "peak" : "mid";
+    const historyDays = (when - new Date(ti[0].datetime)) / 864e5;
+    return { when, timeAssumed, status: "ok", daysSince, interval, phase, historyDays, reliable: historyDays >= 28, predicted: computeLevel(injections, when, 1) };
+  }
+  const PHASE_INFO = {
+    trough: { label: "Trough", color: "#4ade80" },
+    peak: { label: "Near peak", color: "#fb923c" },
+    mid: { label: "Mid-cycle", color: "#60a5fa" }
+  };
+  function computeCalibration(labs, injections) {
+    const used = [], skipped = [];
+    let sw = 0, swr = 0;
+    const now = Date.now();
+    labs.forEach((lab) => {
+      const m = parseFloat(lab.values && lab.values.totalT);
+      if (!(m > 0)) return;
+      const a = analyzeLab(lab, injections);
+      if (a.status !== "ok") {
+        skipped.push({ lab, reason: "no logged injections before this lab" });
+        return;
+      }
+      if (!a.reliable) {
+        skipped.push({ lab, reason: `only ${Math.round(a.historyDays)} days of logged injections before it (28+ needed)` });
+        return;
+      }
+      if (a.predicted < 50) {
+        skipped.push({ lab, reason: "model predicts almost nothing at that time" });
+        return;
+      }
+      const ratio = m / a.predicted;
+      const age = Math.max(0, (now - +a.when) / 864e5);
+      const w = Math.pow(0.5, age / 90);
+      used.push({ lab, a, measured: m, ratio, w });
+      sw += w;
+      swr += w * ratio;
+    });
+    if (!used.length) return { k: 1, used, skipped, applied: false };
+    return { k: Math.min(4, Math.max(0.25, swr / sw)), used, skipped, applied: true };
+  }
+  function vermeulenFreeT(totalNgDl, shbgNmol, albGdl = 4.3) {
+    const TT = totalNgDl * 3467e-14;
+    const SH = shbgNmol * 1e-9;
+    const alb = albGdl * 10 / 66430;
+    const Ksh = 1e9, Kalb = 36e3;
+    const N = 1 + Kalb * alb;
+    const a = Ksh * N, b = N + Ksh * (SH - TT), c = -TT;
+    const FT = (-b + Math.sqrt(b * b - 4 * a * c)) / (2 * a);
+    const nmol = FT * 1e9;
+    return { nmol, pgmL: nmol * 288.42, ngdL: nmol * 28.842, pct: FT / TT * 100 };
   }
   const INJECTION_SITES = [
     { id: "lVG", label: "Left VG", x: 38, y: 52 },
@@ -271,8 +385,6 @@ react-dom/cjs/react-dom-client.production.js:
     const [symptoms, setSymptoms] = useState([]);
     const [labs, setLabs] = useState([]);
     const [loaded, setLoaded] = useState(false);
-    const [pkCurve, setPkCurve] = useState([]);
-    const [currentLevel, setCurrentLevel] = useState(0);
     const [protocol, setProtocol] = useState(DEFAULT_PROTOCOL);
     const [rotationOrder, setRotationOrder] = useState(DEFAULT_ROTATION);
     const [rotationIndex, setRotationIndex] = useState(0);
@@ -285,13 +397,19 @@ react-dom/cjs/react-dom-client.production.js:
     const [showSymptomModal, setShowSymptomModal] = useState(false);
     const [confirmDelete, setConfirmDelete] = useState(null);
     const [selectedSite, setSelectedSite] = useState(null);
-    const [newInj, setNewInj] = useState({ datetime: (/* @__PURE__ */ new Date()).toISOString().slice(0, 16), compounds: [{ name: "Testosterone Cypionate", dose: 100, concentration: 200 }], site: "", notes: "" });
-    const [newLab, setNewLab] = useState({ date: (/* @__PURE__ */ new Date()).toISOString().slice(0, 10), values: {} });
-    const [newSymptom, setNewSymptom] = useState({ date: (/* @__PURE__ */ new Date()).toISOString().slice(0, 10), ratings: {} });
+    const [newInj, setNewInj] = useState({ datetime: localDT(), compounds: [{ name: "Testosterone Cypionate", dose: 100, concentration: 200 }], site: "", notes: "" });
+    const [newLab, setNewLab] = useState({ datetime: localDT(), albumin: "", values: {} });
+    const [newSymptom, setNewSymptom] = useState({ date: localDate(), ratings: {} });
     const [toast, setToast] = useState(null);
     const [estDose, setEstDose] = useState(100);
     const [estEster, setEstEster] = useState("Testosterone Cypionate");
     const [estFreq, setEstFreq] = useState("weekly");
+    const [settings, setSettings] = useState({ autoCalibrate: true, albumin: 4.3, lastBackup: null });
+    const [showBackup, setShowBackup] = useState(false);
+    const [importText, setImportText] = useState("");
+    const [importPreview, setImportPreview] = useState(null);
+    const [importError, setImportError] = useState("");
+    const [manualCopy, setManualCopy] = useState("");
     useEffect(() => {
       (async () => {
         var _a2, _b2;
@@ -300,6 +418,8 @@ react-dom/cjs/react-dom-client.production.js:
         const savedSymptoms = await storageGet("trt:symptoms");
         const savedProtocol = await storageGet("trt:protocol");
         const savedRotation = await storageGet("trt:rotation");
+        const savedSettings = await storageGet("trt:settings");
+        if (savedSettings) setSettings((s) => ({ ...s, ...savedSettings }));
         setInjections(savedInj != null ? savedInj : SAMPLE_INJECTIONS);
         setLabs(savedLabs != null ? savedLabs : []);
         setSymptoms(savedSymptoms != null ? savedSymptoms : []);
@@ -333,9 +453,14 @@ react-dom/cjs/react-dom-client.production.js:
       if (loaded) storageSet("trt:rotation", { order: rotationOrder, index: rotationIndex });
     }, [rotationOrder, rotationIndex, loaded]);
     useEffect(() => {
-      setPkCurve(generatePKCurve(injections));
-      setCurrentLevel(computeLevel(injections, /* @__PURE__ */ new Date()));
-    }, [injections]);
+      if (loaded) storageSet("trt:settings", settings);
+    }, [settings, loaded]);
+    useEffect(() => {
+      try {
+        if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+      } catch (e) {
+      }
+    }, []);
     const showToast = (msg) => {
       setToast(msg);
       setTimeout(() => setToast(null), 3e3);
@@ -354,7 +479,7 @@ react-dom/cjs/react-dom-client.production.js:
       now.setHours(h, m, 0, 0);
       const suggestedSiteId = rotationOrder.length ? rotationOrder[rotationIndex % rotationOrder.length] : "";
       setNewInj({
-        datetime: now.toISOString().slice(0, 16),
+        datetime: localDT(now),
         compounds: protocol.active && protocol.compounds ? protocol.compounds.map((c) => ({ ...c })) : [{ name: "Testosterone Cypionate", dose: 100, concentration: 200 }],
         site: suggestedSiteId,
         notes: ""
@@ -375,7 +500,9 @@ react-dom/cjs/react-dom-client.production.js:
       showToast("Injection logged \u2713");
     };
     const addLab = () => {
-      setLabs((prev) => [...prev, { ...newLab, id: Date.now() }].sort((a, b) => new Date(a.date) - new Date(b.date)));
+      const entry = { ...newLab, date: newLab.datetime.slice(0, 10), id: Date.now() };
+      if (!entry.albumin) delete entry.albumin;
+      setLabs((prev) => [...prev, entry].sort((a, b) => labTime(a) - labTime(b)));
       setShowLabModal(false);
       showToast("Lab results saved");
     };
@@ -385,6 +512,91 @@ react-dom/cjs/react-dom-client.production.js:
       showToast("Symptom log saved");
     };
     if (!loaded) return /* @__PURE__ */ React.createElement("div", { style: { background: "#0a0d12", minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 16, fontFamily: "'DM Sans', sans-serif", color: "#475569" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 36 } }, "\u26A1"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 14, fontWeight: 500 } }, "Loading your data\u2026"));
+    const cal = computeCalibration(labs, injections);
+    const scale = settings.autoCalibrate && cal.applied ? cal.k : 1;
+    const pkCurve = generatePKCurve(injections, scale);
+    const currentLevel = computeLevel(injections, /* @__PURE__ */ new Date(), scale);
+    const latestShbgLab = [...labs].reverse().find((l) => parseFloat(l.values && l.values.shbg) > 0);
+    const albNow = latestShbgLab && parseFloat(latestShbgLab.albumin) > 0 ? parseFloat(latestShbgLab.albumin) : parseFloat(settings.albumin) || 4.3;
+    const freeNow = latestShbgLab && currentLevel > 0 ? vermeulenFreeT(currentLevel, parseFloat(latestShbgLab.values.shbg), albNow) : null;
+    const needsBackup = !settings.lastBackup || Date.now() - +new Date(settings.lastBackup) > 14 * 864e5;
+    const buildBackup = () => ({ app: "trt-tracker", version: 2, exportedAt: (/* @__PURE__ */ new Date()).toISOString(), injections, labs, symptoms, protocol, rotation: { order: rotationOrder, index: rotationIndex }, settings });
+    const markBackedUp = () => setSettings((st) => ({ ...st, lastBackup: (/* @__PURE__ */ new Date()).toISOString() }));
+    const shareBackup = async () => {
+      const json = JSON.stringify(buildBackup(), null, 2);
+      const name = `trt-backup-${localDate()}.json`;
+      try {
+        const file = new File([json], name, { type: "application/json" });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          await navigator.share({ files: [file], title: "TRT Tracker backup" });
+          markBackedUp();
+          showToast("Backup shared");
+          return;
+        }
+      } catch (e) {
+        if (e && e.name === "AbortError") return;
+      }
+      try {
+        const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 2e3);
+        markBackedUp();
+        showToast("Backup downloaded");
+      } catch (e) {
+        setManualCopy(json);
+      }
+    };
+    const copyBackup = async () => {
+      const json = JSON.stringify(buildBackup(), null, 2);
+      try {
+        await navigator.clipboard.writeText(json);
+        markBackedUp();
+        showToast("Backup copied");
+      } catch (e) {
+        setManualCopy(json);
+      }
+    };
+    const parseBackup = (text) => {
+      try {
+        const d = JSON.parse(text);
+        if (!d || typeof d !== "object" || !Array.isArray(d.injections)) throw new Error("bad");
+        setImportPreview(d);
+        setImportError("");
+      } catch (e) {
+        setImportPreview(null);
+        setImportError("That doesn't look like a TRT Tracker backup file.");
+      }
+    };
+    const onImportFile = (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (!f) return;
+      const r = new FileReader();
+      r.onload = () => parseBackup(String(r.result));
+      r.readAsText(f);
+      e.target.value = "";
+    };
+    const applyImport = () => {
+      const d = importPreview;
+      if (!d) return;
+      setInjections(d.injections.slice().sort((a, b) => new Date(a.datetime) - new Date(b.datetime)));
+      setLabs(Array.isArray(d.labs) ? d.labs : []);
+      setSymptoms(Array.isArray(d.symptoms) ? d.symptoms : []);
+      if (d.protocol) setProtocol(d.protocol);
+      if (d.rotation) {
+        setRotationOrder(d.rotation.order || DEFAULT_ROTATION);
+        setRotationIndex(d.rotation.index || 0);
+      }
+      if (d.settings) setSettings((st) => ({ ...st, ...d.settings }));
+      setImportPreview(null);
+      setImportText("");
+      setShowBackup(false);
+      showToast("Backup restored");
+    };
     const siteCounts = injections.reduce((acc, inj) => {
       acc[inj.site] = (acc[inj.site] || 0) + 1;
       return acc;
@@ -421,7 +633,7 @@ react-dom/cjs/react-dom-client.production.js:
       const points = [];
       for (let d = new Date(now); d <= end; d.setHours(d.getHours() + 8)) {
         const t = new Date(d);
-        points.push({ time: +t, label: t.toLocaleDateString("en-US", { month: "short", day: "numeric" }), current: computeLevel(currentSim, t), estimate: computeLevel(estSim, t) });
+        points.push({ time: +t, label: t.toLocaleDateString("en-US", { month: "short", day: "numeric" }), current: computeLevel(currentSim, t, scale), estimate: computeLevel(estSim, t, scale) });
       }
       return points;
     };
@@ -465,7 +677,7 @@ react-dom/cjs/react-dom-client.production.js:
         .remove-btn:hover { color: #f87171; }
         .rotation-chip { border-radius: 20px; padding: 5px 12px; font-size: 12px; font-weight: 600; cursor: pointer; border: 1px solid; font-family: inherit; transition: all 0.15s; display: flex; align-items: center; gap: 6px; }
         select option { background: #1e293b; }
-      `), toast && /* @__PURE__ */ React.createElement("div", { className: "toast" }, "\u2713 ", toast), /* @__PURE__ */ React.createElement("div", { style: { padding: "20px 20px 0", display: "flex", justifyContent: "space-between", alignItems: "center" } }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569", fontWeight: 600, letterSpacing: 2, textTransform: "uppercase" } }, "TRT Tracker"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 20, fontWeight: 700, letterSpacing: -0.5 } }, "My Protocol")), /* @__PURE__ */ React.createElement("div", { style: { textAlign: "right" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: 1 } }, "Current T Level"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 26, fontWeight: 700, color: levelColor, fontFamily: "'DM Mono', monospace" } }, currentLevel, " ", /* @__PURE__ */ React.createElement("span", { style: { fontSize: 12, fontWeight: 400 } }, "ng/dL")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: levelColor, fontWeight: 600 } }, levelLabel))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4, padding: "16px 16px 0", borderBottom: "1px solid #1e293b" } }, tabs.map((t) => /* @__PURE__ */ React.createElement(
+      `), toast && /* @__PURE__ */ React.createElement("div", { className: "toast" }, "\u2713 ", toast), showBackup && /* @__PURE__ */ React.createElement("div", { className: "modal-overlay", onClick: (e) => e.target === e.currentTarget && setShowBackup(false) }, /* @__PURE__ */ React.createElement("div", { className: "modal-sheet" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 17, fontWeight: 700 } }, "Backup & Restore"), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowBackup(false), style: { background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer", padding: 0 } }, "\u2715")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: needsBackup ? "#fb923c" : "#4ade80", marginBottom: 12 } }, settings.lastBackup ? `Last backup: ${new Date(settings.lastBackup).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}` : "No backup yet"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: "#94a3b8", lineHeight: 1.5, marginBottom: 12 } }, "Your data lives only in this browser on this device. Save a backup file to Files or iCloud now and then. If Safari ever clears site data, restore from it."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 10 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { width: "100%", padding: 14 }, onClick: shareBackup }, "Save / share backup file"), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { width: "100%", padding: 12 }, onClick: copyBackup }, "Copy backup to clipboard"), manualCopy && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", null, "Press and hold, Select All, Copy"), /* @__PURE__ */ React.createElement("textarea", { readOnly: true, rows: 5, value: manualCopy, onFocus: (e) => e.target.select() })), /* @__PURE__ */ React.createElement("div", { style: { borderTop: "1px solid #1e293b", paddingTop: 14, marginTop: 4 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 700, marginBottom: 8 } }, "Restore from backup"), /* @__PURE__ */ React.createElement("input", { type: "file", accept: ".json,application/json,text/plain", onChange: onImportFile }), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569", margin: "8px 0 4px" } }, "or paste backup text:"), /* @__PURE__ */ React.createElement("textarea", { rows: 3, value: importText, onChange: (e) => setImportText(e.target.value), placeholder: "Paste backup JSON here" }), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { width: "100%", padding: 10, marginTop: 8 }, onClick: () => parseBackup(importText) }, "Read pasted text"), importError && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: "#f87171", marginTop: 8 } }, importError), importPreview && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, background: "#0f172a", border: "1px solid #1e293b", borderRadius: 10, padding: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: "#e2e8f0", marginBottom: 8 } }, "Found ", importPreview.injections.length, " injections, ", (importPreview.labs || []).length, " labs, ", (importPreview.symptoms || []).length, " symptom logs. Restoring replaces everything currently in the app."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { flex: 1, padding: 10 }, onClick: () => setImportPreview(null) }, "Cancel"), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { flex: 1, padding: 10 }, onClick: applyImport }, "Replace my data"))))))), /* @__PURE__ */ React.createElement("div", { style: { padding: "20px 20px 0", display: "flex", justifyContent: "space-between", alignItems: "center" } }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569", fontWeight: 600, letterSpacing: 2, textTransform: "uppercase" } }, "TRT Tracker"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 20, fontWeight: 700, letterSpacing: -0.5 } }, "My Protocol"), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowBackup(true), className: "btn-ghost", style: { marginTop: 6, padding: "4px 10px", fontSize: 11, position: "relative" } }, "\u{1F4BE} Backup", needsBackup && /* @__PURE__ */ React.createElement("span", { style: { position: "absolute", top: -3, right: -3, width: 9, height: 9, borderRadius: "50%", background: "#f87171" } }))), /* @__PURE__ */ React.createElement("div", { style: { textAlign: "right" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: 1 } }, "Current T Level"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 26, fontWeight: 700, color: levelColor, fontFamily: "'DM Mono', monospace" } }, currentLevel, " ", /* @__PURE__ */ React.createElement("span", { style: { fontSize: 12, fontWeight: 400 } }, "ng/dL")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: levelColor, fontWeight: 600 } }, levelLabel), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: "#475569", marginTop: 2 } }, scale !== 1 ? `calibrated \xD7${scale.toFixed(2)} \xB7 ${cal.used.length} lab${cal.used.length === 1 ? "" : "s"}` : "uncalibrated estimate"), freeNow && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: "#64748b" } }, "free T \u2248 ", freeNow.ngdL.toFixed(1), " ng/dL \xB7 ", freeNow.pct.toFixed(1), "%"))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4, padding: "16px 16px 0", borderBottom: "1px solid #1e293b" } }, tabs.map((t) => /* @__PURE__ */ React.createElement(
       "button",
       {
         key: t.id,
@@ -581,17 +793,30 @@ react-dom/cjs/react-dom-client.production.js:
         return { ...p, compounds: [{ name: estEster, dose: estDose, concentration: (_c2 = (_b2 = (_a2 = p.compounds) == null ? void 0 : _a2[0]) == null ? void 0 : _b2.concentration) != null ? _c2 : 200 }], frequency: estFreq, active: true };
       });
       showToast("Protocol updated from simulation");
-    } }, "Apply as My Protocol")), activeTab === "labs" && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { width: "100%", padding: 14 }, onClick: () => setShowLabModal(true) }, "+ Log Lab Results"), labs.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 40, textAlign: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 40, marginBottom: 12 } }, "\u{1F9EA}"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 15, fontWeight: 600, marginBottom: 6 } }, "No Lab Results Yet"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, color: "#475569" } }, "Log your bloodwork to track trends and correlate with protocol changes.")) : /* @__PURE__ */ React.createElement(React.Fragment, null, LAB_MARKERS.filter((m) => labs.some((l) => l.values[m.key])).map((marker) => {
-      const data = labs.filter((l) => l.values[marker.key]).map((l) => ({ date: l.date, value: parseFloat(l.values[marker.key]), label: new Date(l.date).toLocaleDateString("en-US", { month: "short", day: "numeric" }) }));
+    } }, "Apply as My Protocol")), activeTab === "labs" && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { width: "100%", padding: 14 }, onClick: () => {
+      setNewLab({ datetime: localDT(), albumin: "", values: {} });
+      setShowLabModal(true);
+    } }, "+ Log Lab Results"), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 700 } }, "Model calibration"), /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { padding: "4px 10px", fontSize: 11, color: settings.autoCalibrate ? "#4ade80" : "#94a3b8" }, onClick: () => setSettings((st) => ({ ...st, autoCalibrate: !st.autoCalibrate })) }, settings.autoCalibrate ? "Auto: ON" : "Auto: OFF")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: "#94a3b8", lineHeight: 1.5, marginBottom: 8 } }, cal.applied ? `Your measured Total T averages ${cal.k.toFixed(2)}\xD7 what the uncalibrated model predicts at your draw times${settings.autoCalibrate ? ", so every level on the dashboard and Estimate tab is scaled by that." : " (calibration is off, so it is not applied)."}` : "Log a Total T lab (with its draw time) and the model will scale itself to you. Labs need 28+ days of logged injections before them."), cal.used.map((u) => /* @__PURE__ */ React.createElement("div", { key: u.lab.id, style: { fontSize: 11, color: "#64748b", display: "flex", justifyContent: "space-between", padding: "3px 0", gap: 8 } }, /* @__PURE__ */ React.createElement("span", null, fmtDate(u.lab.date), " \xB7 ", /* @__PURE__ */ React.createElement("span", { style: { color: PHASE_INFO[u.a.phase].color } }, PHASE_INFO[u.a.phase].label)), /* @__PURE__ */ React.createElement("span", null, "measured ", Math.round(u.measured), " \xB7 model ", u.a.predicted, " \xB7 \xD7", u.ratio.toFixed(2)))), cal.skipped.map((u) => /* @__PURE__ */ React.createElement("div", { key: u.lab.id, style: { fontSize: 11, color: "#a16207", padding: "3px 0" } }, fmtDate(u.lab.date), " not used: ", u.reason)), cal.used.length > 1 && Math.max(...cal.used.map((u) => u.ratio)) / Math.min(...cal.used.map((u) => u.ratio)) > 1.3 && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#a16207", marginTop: 6 } }, "Your labs disagree by more than 30% \u2014 one scale factor can't fit both. Check draw times or logged doses."), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10 } }, /* @__PURE__ */ React.createElement("label", null, "Default albumin for free T (g/dL)"), /* @__PURE__ */ React.createElement("input", { type: "number", step: "0.1", value: settings.albumin, onChange: (e) => setSettings((st) => ({ ...st, albumin: e.target.value })) }))), labs.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 40, textAlign: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 40, marginBottom: 12 } }, "\u{1F9EA}"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 15, fontWeight: 600, marginBottom: 6 } }, "No Lab Results Yet"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, color: "#475569" } }, "Log your bloodwork to track trends and correlate with protocol changes.")) : /* @__PURE__ */ React.createElement(React.Fragment, null, LAB_MARKERS.filter((m) => labs.some((l) => l.values[m.key])).map((marker) => {
+      const data = labs.filter((l) => l.values[marker.key]).map((l) => ({ date: l.date, value: parseFloat(l.values[marker.key]), label: fmtDate(l.date) }));
       const latest = data[data.length - 1];
       const isOptimal = latest && latest.value >= marker.optimal[0] && latest.value <= marker.optimal[1];
       return /* @__PURE__ */ React.createElement("div", { key: marker.key, className: "card", style: { padding: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600 } }, marker.label), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 700, color: isOptimal ? "#4ade80" : "#fb923c" } }, latest == null ? void 0 : latest.value, " ", /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: "#475569", fontWeight: 400 } }, marker.unit))), /* @__PURE__ */ React.createElement("div", { style: { height: 6, background: "#0f172a", borderRadius: 3, position: "relative", marginBottom: 10 } }, /* @__PURE__ */ React.createElement("div", { style: { position: "absolute", left: `${(marker.optimal[0] - marker.range[0]) / (marker.range[1] - marker.range[0]) * 100}%`, width: `${(marker.optimal[1] - marker.optimal[0]) / (marker.range[1] - marker.range[0]) * 100}%`, height: "100%", background: "#166534", borderRadius: 3 } }), latest && /* @__PURE__ */ React.createElement("div", { style: { position: "absolute", left: `${Math.min(100, Math.max(0, (latest.value - marker.range[0]) / (marker.range[1] - marker.range[0]) * 100))}%`, width: 10, height: 10, background: isOptimal ? "#4ade80" : "#fb923c", borderRadius: "50%", top: -2, transform: "translateX(-50%)" } })), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: "#475569", display: "flex", justifyContent: "space-between", marginBottom: 8 } }, /* @__PURE__ */ React.createElement("span", null, "Range: ", marker.range[0], "\u2013", marker.range[1]), /* @__PURE__ */ React.createElement("span", null, "Optimal: ", marker.optimal[0], "\u2013", marker.optimal[1])), data.length > 1 && /* @__PURE__ */ React.createElement(SvgSparkline, { data, dataKey: "value", height: 60, stroke: "#3b82f6", dots: true, domain: [marker.range[0] * 0.8, marker.range[1] * 1.1], unit: marker.unit }));
-    }), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "#94a3b8", marginBottom: 12 } }, "Lab History"), [...labs].reverse().map((lab) => /* @__PURE__ */ React.createElement("div", { key: lab.id, style: { padding: "10px 0", borderBottom: "1px solid #0f172a" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600 } }, new Date(lab.date).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })), /* @__PURE__ */ React.createElement("button", { onClick: () => setConfirmDelete({ type: "lab", id: lab.id }), style: { background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 15, padding: "2px" } }, "\u{1F5D1}")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6 } }, LAB_MARKERS.filter((m) => lab.values[m.key]).map((m) => /* @__PURE__ */ React.createElement("span", { key: m.key, style: { fontSize: 11, background: "#0f172a", padding: "3px 8px", borderRadius: 6, color: "#94a3b8" } }, m.label, ": ", lab.values[m.key], " ", m.unit)))))))), activeTab === "symptoms" && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { width: "100%", padding: 14 }, onClick: () => setShowSymptomModal(true) }, "+ Log Symptoms"), symptoms.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 40, textAlign: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 40, marginBottom: 12 } }, "\u{1F4CA}"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 15, fontWeight: 600, marginBottom: 6 } }, "Start Tracking Symptoms"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, color: "#475569" } }, "Log daily to uncover patterns between your protocol and how you feel.")) : /* @__PURE__ */ React.createElement(React.Fragment, null, ["Energy Level", "Libido", "Mood", "Sleep Quality"].map((sym) => {
+    }), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "#94a3b8", marginBottom: 12 } }, "Lab History"), [...labs].reverse().map((lab) => {
+      const an = analyzeLab(lab, injections);
+      const tt = parseFloat(lab.values.totalT);
+      const sh = parseFloat(lab.values.shbg);
+      const alb = parseFloat(lab.albumin) > 0 ? parseFloat(lab.albumin) : parseFloat(settings.albumin) || 4.3;
+      const ft = tt > 0 && sh > 0 ? vermeulenFreeT(tt, sh, alb) : null;
+      return /* @__PURE__ */ React.createElement("div", { key: lab.id, style: { padding: "10px 0", borderBottom: "1px solid #0f172a" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600 } }, fmtDate(lab.date, { month: "long", day: "numeric", year: "numeric" }), lab.datetime ? ` \xB7 ${new Date(lab.datetime).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}` : ""), /* @__PURE__ */ React.createElement("button", { onClick: () => setConfirmDelete({ type: "lab", id: lab.id }), style: { background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 15, padding: "2px" } }, "\u{1F5D1}")), an.status === "ok" ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, marginBottom: 6, color: "#64748b" } }, /* @__PURE__ */ React.createElement("span", { style: { color: PHASE_INFO[an.phase].color, fontWeight: 700 } }, PHASE_INFO[an.phase].label), " \xB7 drawn ", fmtSince(an.daysSince), " after your last injection (cycle \u2248 ", an.interval.toFixed(1), "d)", an.timeAssumed ? " \xB7 time assumed 8:00 AM" : "", tt > 0 && /* @__PURE__ */ React.createElement("span", null, " \xB7 model said ", Math.round(an.predicted * scale), " vs measured ", Math.round(tt))) : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, marginBottom: 6, color: "#64748b" } }, "No logged injection before this draw"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6 } }, LAB_MARKERS.filter((m) => lab.values[m.key]).map((m) => /* @__PURE__ */ React.createElement("span", { key: m.key, style: { fontSize: 11, background: "#0f172a", padding: "3px 8px", borderRadius: 6, color: "#94a3b8" } }, m.label, ": ", lab.values[m.key], " ", m.unit)), ft && /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, background: "#0f172a", padding: "3px 8px", borderRadius: 6, color: "#93c5fd" } }, "Calc. free T (Vermeulen): ", ft.ngdL.toFixed(1), " ng/dL \xB7 ", ft.pgmL.toFixed(0), " pg/mL \xB7 ", ft.pct.toFixed(2), "%")));
+    })))), activeTab === "symptoms" && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { width: "100%", padding: 14 }, onClick: () => {
+      setNewSymptom({ date: localDate(), ratings: {} });
+      setShowSymptomModal(true);
+    } }, "+ Log Symptoms"), symptoms.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 40, textAlign: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 40, marginBottom: 12 } }, "\u{1F4CA}"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 15, fontWeight: 600, marginBottom: 6 } }, "Start Tracking Symptoms"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, color: "#475569" } }, "Log daily to uncover patterns between your protocol and how you feel.")) : /* @__PURE__ */ React.createElement(React.Fragment, null, ["Energy Level", "Libido", "Mood", "Sleep Quality"].map((sym) => {
       var _a2, _b2, _c2;
-      const data = symptoms.filter((s) => s.ratings[sym] !== void 0).map((s) => ({ label: new Date(s.date).toLocaleDateString("en-US", { month: "short", day: "numeric" }), value: s.ratings[sym] }));
+      const data = symptoms.filter((s) => s.ratings[sym] !== void 0).map((s) => ({ label: fmtDate(s.date), value: s.ratings[sym] }));
       if (!data.length) return null;
       return /* @__PURE__ */ React.createElement("div", { key: sym, className: "card", style: { padding: 14 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", marginBottom: 8 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600 } }, sym), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 700, color: ((_a2 = data[data.length - 1]) == null ? void 0 : _a2.value) >= 7 ? "#4ade80" : ((_b2 = data[data.length - 1]) == null ? void 0 : _b2.value) >= 4 ? "#fb923c" : "#f87171" } }, (_c2 = data[data.length - 1]) == null ? void 0 : _c2.value, "/10")), /* @__PURE__ */ React.createElement(SvgSparkline, { data, dataKey: "value", height: 50, stroke: "#3b82f6", fill: "rgba(59,130,246,0.15)", domain: [0, 10] }));
-    }), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "#94a3b8", marginBottom: 12 } }, "Symptom Log"), [...symptoms].reverse().map((sym) => /* @__PURE__ */ React.createElement("div", { key: sym.id, style: { padding: "10px 0", borderBottom: "1px solid #0f172a" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600 } }, new Date(sym.date).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })), /* @__PURE__ */ React.createElement("button", { onClick: () => setConfirmDelete({ type: "symptom", id: sym.id }), style: { background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 15 } }, "\u{1F5D1}")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 5 } }, Object.entries(sym.ratings).map(([k, v]) => /* @__PURE__ */ React.createElement("span", { key: k, style: { fontSize: 11, background: "#0f172a", padding: "3px 8px", borderRadius: 6, color: v >= 7 ? "#4ade80" : v >= 4 ? "#fb923c" : "#f87171" } }, k, ": ", v))))))))), showInjModal && /* @__PURE__ */ React.createElement("div", { className: "modal-overlay", onClick: (e) => e.target === e.currentTarget && setShowInjModal(false) }, /* @__PURE__ */ React.createElement("div", { className: "modal-sheet" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 17, fontWeight: 700 } }, "Log Injection"), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowInjModal(false), style: { background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer", padding: 0 } }, "\u2715")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 14, marginBottom: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", alignItems: "center", gap: 8 } }, /* @__PURE__ */ React.createElement(SyringeVisual, { compounds: newInj.compounds }), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", textAlign: "center" } }, newInj.compounds.reduce((s, c) => s + (c.dose || 0), 0), "mg total"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: "#475569", textAlign: "center" } }, newInj.compounds.reduce((s, c) => s + (c.dose || 0) / (c.concentration || 200), 0).toFixed(2), "mL")), /* @__PURE__ */ React.createElement("div", { style: { flex: 1, display: "flex", flexDirection: "column", gap: 8 } }, newInj.compounds.map((c, idx) => {
+    }), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "#94a3b8", marginBottom: 12 } }, "Symptom Log"), [...symptoms].reverse().map((sym) => /* @__PURE__ */ React.createElement("div", { key: sym.id, style: { padding: "10px 0", borderBottom: "1px solid #0f172a" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600 } }, fmtDate(sym.date, { month: "long", day: "numeric", year: "numeric" })), /* @__PURE__ */ React.createElement("button", { onClick: () => setConfirmDelete({ type: "symptom", id: sym.id }), style: { background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 15 } }, "\u{1F5D1}")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 5 } }, Object.entries(sym.ratings).map(([k, v]) => /* @__PURE__ */ React.createElement("span", { key: k, style: { fontSize: 11, background: "#0f172a", padding: "3px 8px", borderRadius: 6, color: v >= 7 ? "#4ade80" : v >= 4 ? "#fb923c" : "#f87171" } }, k, ": ", v))))))))), showInjModal && /* @__PURE__ */ React.createElement("div", { className: "modal-overlay", onClick: (e) => e.target === e.currentTarget && setShowInjModal(false) }, /* @__PURE__ */ React.createElement("div", { className: "modal-sheet" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 17, fontWeight: 700 } }, "Log Injection"), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowInjModal(false), style: { background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer", padding: 0 } }, "\u2715")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 14, marginBottom: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", alignItems: "center", gap: 8 } }, /* @__PURE__ */ React.createElement(SyringeVisual, { compounds: newInj.compounds }), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", textAlign: "center" } }, newInj.compounds.reduce((s, c) => s + (c.dose || 0), 0), "mg total"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: "#475569", textAlign: "center" } }, newInj.compounds.reduce((s, c) => s + (c.dose || 0) / (c.concentration || 200), 0).toFixed(2), "mL")), /* @__PURE__ */ React.createElement("div", { style: { flex: 1, display: "flex", flexDirection: "column", gap: 8 } }, newInj.compounds.map((c, idx) => {
       var _a2;
       const params = COMPOUND_PARAMS[c.name] || {};
       const vol = ((c.dose || 0) / (c.concentration || 200)).toFixed(2);
@@ -717,7 +942,10 @@ react-dom/cjs/react-dom-client.production.js:
       setProtocol({ ...editProtocol, active: true });
       setShowProtocolModal(false);
       showToast("Protocol saved");
-    } }, "Save Protocol")))), showLabModal && /* @__PURE__ */ React.createElement("div", { className: "modal-overlay", onClick: (e) => e.target === e.currentTarget && setShowLabModal(false) }, /* @__PURE__ */ React.createElement("div", { className: "modal-sheet" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 17, fontWeight: 700 } }, "Log Lab Results"), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowLabModal(false), style: { background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer", padding: 0 } }, "\u2715")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 12 } }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", null, "Lab Date"), /* @__PURE__ */ React.createElement("input", { type: "date", value: newLab.date, onChange: (e) => setNewLab((p) => ({ ...p, date: e.target.value })) })), LAB_MARKERS.map((m) => /* @__PURE__ */ React.createElement("div", { key: m.key }, /* @__PURE__ */ React.createElement("label", null, m.label, " (", m.unit, ")"), /* @__PURE__ */ React.createElement("input", { type: "number", placeholder: `Optimal: ${m.optimal[0]}\u2013${m.optimal[1]}`, value: newLab.values[m.key] || "", onChange: (e) => setNewLab((p) => ({ ...p, values: { ...p.values, [m.key]: e.target.value } })), step: "0.1" }))), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { width: "100%", padding: 14, marginTop: 4 }, onClick: addLab }, "Save Lab Results")))), confirmDelete && /* @__PURE__ */ React.createElement("div", { className: "modal-overlay", onClick: () => setConfirmDelete(null) }, /* @__PURE__ */ React.createElement("div", { className: "modal-sheet", style: { paddingBottom: 32 }, onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", paddingTop: 8 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 36, marginBottom: 12 } }, "\u{1F5D1}"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 17, fontWeight: 700, marginBottom: 8 } }, "Delete Entry?"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, color: "#64748b", marginBottom: 24 } }, "This ", confirmDelete.type, " entry will be permanently removed."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { flex: 1, padding: 14 }, onClick: () => setConfirmDelete(null) }, "Cancel"), /* @__PURE__ */ React.createElement("button", { onClick: deleteEntry, style: { flex: 1, padding: 14, background: "#7f1d1d", border: "1px solid #991b1b", color: "#fca5a5", borderRadius: 12, fontFamily: "inherit", fontWeight: 600, fontSize: 14, cursor: "pointer" } }, "Delete"))))), showSymptomModal && /* @__PURE__ */ React.createElement("div", { className: "modal-overlay", onClick: (e) => e.target === e.currentTarget && setShowSymptomModal(false) }, /* @__PURE__ */ React.createElement("div", { className: "modal-sheet" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 17, fontWeight: 700 } }, "Log Symptoms"), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowSymptomModal(false), style: { background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer", padding: 0 } }, "\u2715")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", null, "Date"), /* @__PURE__ */ React.createElement("input", { type: "date", value: newSymptom.date, onChange: (e) => setNewSymptom((p) => ({ ...p, date: e.target.value })) })), Object.entries(SYMPTOM_CATEGORIES).map(([cat, syms]) => /* @__PURE__ */ React.createElement("div", { key: cat }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: "#3b82f6", fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 10 } }, cat), syms.map((sym) => /* @__PURE__ */ React.createElement("div", { key: sym, style: { marginBottom: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", marginBottom: 4 } }, /* @__PURE__ */ React.createElement("span", { style: { fontSize: 13, color: "#94a3b8" } }, sym), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 13, fontWeight: 700, color: (newSymptom.ratings[sym] || 5) >= 7 ? "#4ade80" : (newSymptom.ratings[sym] || 5) >= 4 ? "#fb923c" : "#f87171" } }, newSymptom.ratings[sym] || 5, "/10")), /* @__PURE__ */ React.createElement("div", { className: "slider-wrap" }, /* @__PURE__ */ React.createElement("input", { type: "range", min: 1, max: 10, value: newSymptom.ratings[sym] || 5, onChange: (e) => setNewSymptom((p) => ({ ...p, ratings: { ...p.ratings, [sym]: parseInt(e.target.value) } })), style: { width: "100%" } })))))), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { width: "100%", padding: 14, marginTop: 4 }, onClick: addSymptom }, "Save Symptom Log")))));
+    } }, "Save Protocol")))), showLabModal && /* @__PURE__ */ React.createElement("div", { className: "modal-overlay", onClick: (e) => e.target === e.currentTarget && setShowLabModal(false) }, /* @__PURE__ */ React.createElement("div", { className: "modal-sheet" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 17, fontWeight: 700 } }, "Log Lab Results"), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowLabModal(false), style: { background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer", padding: 0 } }, "\u2715")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 12 } }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", null, "Blood draw date & time"), /* @__PURE__ */ React.createElement("input", { type: "datetime-local", value: newLab.datetime, onChange: (e) => setNewLab((p) => ({ ...p, datetime: e.target.value })) }), (() => {
+      const an = analyzeLab({ datetime: newLab.datetime, values: {} }, injections);
+      return an.status === "ok" ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, marginTop: 6, color: "#64748b" } }, /* @__PURE__ */ React.createElement("span", { style: { color: PHASE_INFO[an.phase].color, fontWeight: 700 } }, PHASE_INFO[an.phase].label), " \u2014 ", fmtSince(an.daysSince), " after your last injection (cycle \u2248 ", an.interval.toFixed(1), "d)") : /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, marginTop: 6, color: "#64748b" } }, "No logged injection before this time");
+    })()), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", null, "Albumin (g/dL) \u2014 optional, for free T"), /* @__PURE__ */ React.createElement("input", { type: "number", step: "0.1", placeholder: `Default ${settings.albumin}`, value: newLab.albumin, onChange: (e) => setNewLab((p) => ({ ...p, albumin: e.target.value })) })), LAB_MARKERS.map((m) => /* @__PURE__ */ React.createElement("div", { key: m.key }, /* @__PURE__ */ React.createElement("label", null, m.label, " (", m.unit, ")"), /* @__PURE__ */ React.createElement("input", { type: "number", placeholder: `Optimal: ${m.optimal[0]}\u2013${m.optimal[1]}`, value: newLab.values[m.key] || "", onChange: (e) => setNewLab((p) => ({ ...p, values: { ...p.values, [m.key]: e.target.value } })), step: "0.1" }))), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { width: "100%", padding: 14, marginTop: 4 }, onClick: addLab }, "Save Lab Results")))), confirmDelete && /* @__PURE__ */ React.createElement("div", { className: "modal-overlay", onClick: () => setConfirmDelete(null) }, /* @__PURE__ */ React.createElement("div", { className: "modal-sheet", style: { paddingBottom: 32 }, onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", paddingTop: 8 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 36, marginBottom: 12 } }, "\u{1F5D1}"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 17, fontWeight: 700, marginBottom: 8 } }, "Delete Entry?"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, color: "#64748b", marginBottom: 24 } }, "This ", confirmDelete.type, " entry will be permanently removed."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10 } }, /* @__PURE__ */ React.createElement("button", { className: "btn-ghost", style: { flex: 1, padding: 14 }, onClick: () => setConfirmDelete(null) }, "Cancel"), /* @__PURE__ */ React.createElement("button", { onClick: deleteEntry, style: { flex: 1, padding: 14, background: "#7f1d1d", border: "1px solid #991b1b", color: "#fca5a5", borderRadius: 12, fontFamily: "inherit", fontWeight: 600, fontSize: 14, cursor: "pointer" } }, "Delete"))))), showSymptomModal && /* @__PURE__ */ React.createElement("div", { className: "modal-overlay", onClick: (e) => e.target === e.currentTarget && setShowSymptomModal(false) }, /* @__PURE__ */ React.createElement("div", { className: "modal-sheet" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 17, fontWeight: 700 } }, "Log Symptoms"), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowSymptomModal(false), style: { background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer", padding: 0 } }, "\u2715")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", null, "Date"), /* @__PURE__ */ React.createElement("input", { type: "date", value: newSymptom.date, onChange: (e) => setNewSymptom((p) => ({ ...p, date: e.target.value })) })), Object.entries(SYMPTOM_CATEGORIES).map(([cat, syms]) => /* @__PURE__ */ React.createElement("div", { key: cat }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: "#3b82f6", fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 10 } }, cat), syms.map((sym) => /* @__PURE__ */ React.createElement("div", { key: sym, style: { marginBottom: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", marginBottom: 4 } }, /* @__PURE__ */ React.createElement("span", { style: { fontSize: 13, color: "#94a3b8" } }, sym), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 13, fontWeight: 700, color: (newSymptom.ratings[sym] || 5) >= 7 ? "#4ade80" : (newSymptom.ratings[sym] || 5) >= 4 ? "#fb923c" : "#f87171" } }, newSymptom.ratings[sym] || 5, "/10")), /* @__PURE__ */ React.createElement("div", { className: "slider-wrap" }, /* @__PURE__ */ React.createElement("input", { type: "range", min: 1, max: 10, value: newSymptom.ratings[sym] || 5, onChange: (e) => setNewSymptom((p) => ({ ...p, ratings: { ...p.ratings, [sym]: parseInt(e.target.value) } })), style: { width: "100%" } })))))), /* @__PURE__ */ React.createElement("button", { className: "btn-primary", style: { width: "100%", padding: 14, marginTop: 4 }, onClick: addSymptom }, "Save Symptom Log")))));
   }
   ReactDOM.createRoot(document.getElementById("root")).render(/* @__PURE__ */ React.createElement(TRTTracker, null));
 })();
