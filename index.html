@@ -71,7 +71,7 @@ react-dom/cjs/react-dom-client.production.js:
 </script>
 <script>window.addEventListener("error",function(e){if(!window.__mounted){document.getElementById("root").innerHTML="<pre style=\"color:#f87171;padding:20px;white-space:pre-wrap\">App error: "+e.message+"</pre>";}});</script>
 <script>(() => {
-  const { useState, useEffect, useMemo } = React;
+  const { useState, useEffect, useMemo, useRef } = React;
   const COMPOUND_PARAMS = {
     "Testosterone Cypionate": { halfLife: 8, peakDays: 2, label: "T-Cyp", color: "#3b82f6", category: "Testosterone" },
     "Testosterone Enanthate": { halfLife: 7, peakDays: 1.5, label: "T-Enan", color: "#60a5fa", category: "Testosterone" },
@@ -145,18 +145,6 @@ react-dom/cjs/react-dom-client.production.js:
       });
     });
     return Math.round(total * BASE_SCALE * scale);
-  }
-  function generatePKCurve(injections, scale = 1) {
-    if (!injections.length) return [];
-    const now = /* @__PURE__ */ new Date();
-    const earliest = new Date(Math.min(...injections.map((i) => new Date(i.datetime))));
-    earliest.setDate(earliest.getDate() - 1);
-    const end = new Date(now.getTime() + 30 * 864e5);
-    const points = [];
-    for (let d = new Date(earliest); d <= end; d.setHours(d.getHours() + 6)) {
-      points.push({ time: +d, level: computeLevel(injections, d, scale), label: d.toLocaleDateString("en-US", { month: "short", day: "numeric" }) });
-    }
-    return points;
   }
   function tInjections(injections) {
     return injections.map(normalizeInj).filter((i) => i.compounds.some((c) => isTCompound(c.name) && (parseFloat(c.dose) || 0) > 0)).sort((a, b) => new Date(a.datetime) - new Date(b.datetime));
@@ -378,8 +366,104 @@ react-dom/cjs/react-dom-client.production.js:
       }
     )), tip && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("line", { x1: tip.x, y1: PAD.top, x2: tip.x, y2: PAD.top + innerH, stroke: "#334155", strokeWidth: "1" }), tip.vals.map((sv) => /* @__PURE__ */ React.createElement("circle", { key: sv.key, cx: tip.x, cy: toY(sv.v), r: 3.5, fill: sv.color })))), tip && /* @__PURE__ */ React.createElement("div", { style: { position: "absolute", top: PAD.top, left: Math.min(tip.x / W * 100, 65) + "%", background: "#111827", border: "1px solid #1e293b", borderRadius: 8, padding: "6px 10px", fontSize: 11, color: "#e2e8f0", whiteSpace: "nowrap", pointerEvents: "none", zIndex: 10 } }, /* @__PURE__ */ React.createElement("div", { style: { color: "#64748b", marginBottom: 4 } }, tip.label), tip.vals.map((sv) => /* @__PURE__ */ React.createElement("div", { key: sv.key, style: { display: "flex", gap: 6, alignItems: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { width: 8, height: 2, background: sv.color, borderRadius: 1, flexShrink: 0 } }), /* @__PURE__ */ React.createElement("span", { style: { fontWeight: 600 } }, Math.round(sv.v), " ng/dL")))));
   }
+  function LevelChart({ injections, scale, range, onRange }) {
+    const W = 360, H = 210, L = 38, R = 10, T = 8, B = 24;
+    const svgRef = useRef(null);
+    const [cursor, setCursor] = useState(null);
+    const nowMs = Math.floor(Date.now() / 6e4) * 6e4;
+    const stepMs = (range <= 7 ? 1 : range <= 30 ? 3 : range <= 90 ? 6 : 12) * 36e5;
+    const t0 = Math.floor((nowMs - range * 864e5) / stepMs) * stepMs;
+    const t1 = nowMs + 864e5;
+    const firstInj = injections.length ? Math.min(...injections.map((i) => +new Date(i.datetime))) : null;
+    const { pts, lo, hi } = useMemo(() => {
+      const out = [];
+      let lo2 = Infinity, hi2 = -Infinity;
+      for (let t = t0; t <= t1; t += stepMs) {
+        const v = computeLevel(injections, new Date(t), scale);
+        out.push([t, v]);
+        if (v < lo2) lo2 = v;
+        if (v > hi2) hi2 = v;
+      }
+      return { pts: out, lo: lo2, hi: hi2 };
+    }, [injections, scale, range, nowMs]);
+    if (firstInj === null || hi <= 0) {
+      return /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, color: "#475569", padding: "30px 0", textAlign: "center" } }, "Log an injection to see your level curve.");
+    }
+    const span = Math.max(hi - lo, 50);
+    const pad = Math.max(30, span * 0.12);
+    const ystep = [25, 50, 100, 200, 250, 500, 1e3].find((s) => (span + 2 * pad) / s <= 6) || 1e3;
+    const ymin = Math.max(0, Math.floor((lo - pad) / ystep) * ystep);
+    const ymax = Math.ceil((hi + pad) / ystep) * ystep;
+    const xOf = (t) => L + (t - t0) / (t1 - t0) * (W - L - R);
+    const yOf = (v) => T + (1 - (v - ymin) / (ymax - ymin)) * (H - T - B);
+    const lvl = (t) => computeLevel(injections, new Date(t), scale);
+    const line = pts.map((p, i) => `${i ? "L" : "M"}${xOf(p[0]).toFixed(1)},${yOf(p[1]).toFixed(1)}`).join(" ");
+    const area = `${line} L${xOf(t1).toFixed(1)},${(H - B).toFixed(1)} L${xOf(t0).toFixed(1)},${(H - B).toFixed(1)} Z`;
+    const stepDays = range <= 7 ? 1 : range <= 30 ? 5 : range <= 90 ? 15 : 30;
+    const mid = new Date(nowMs);
+    mid.setHours(0, 0, 0, 0);
+    const xticks = [];
+    for (let k = 0; k < 400; k++) {
+      const t = +new Date(mid.getFullYear(), mid.getMonth(), mid.getDate() - k * stepDays);
+      if (t < t0) break;
+      xticks.push(t);
+    }
+    const yticks = [];
+    for (let v = ymin; v <= ymax; v += ystep) yticks.push(v);
+    const refs = [300, 1e3].filter((v) => v > ymin && v < ymax);
+    const showInj = range <= 30;
+    const marks = showInj ? injections.map((i) => +new Date(i.datetime)).filter((t) => t >= t0 && t <= t1) : [];
+    const past = pts.filter((p) => p[0] <= nowMs && p[0] >= firstInj);
+    let pk = null, tr = null;
+    past.forEach((p) => {
+      if (!pk || p[1] > pk[1]) pk = p;
+      if (!tr || p[1] < tr[1]) tr = p;
+    });
+    const fmtDT = (t) => new Date(t).toLocaleDateString("en-US", { month: "short", day: "numeric" }) + ", " + new Date(t).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+    const pick = (e) => {
+      const r = svgRef.current.getBoundingClientRect();
+      const x = (e.clientX - r.left) / r.width * W;
+      const f = Math.min(1, Math.max(0, (x - L) / (W - L - R)));
+      setCursor(Math.round(t0 + f * (t1 - t0)));
+    };
+    const rt = cursor === null ? nowMs : cursor;
+    const lv = lvl(rt), l1 = lvl(rt - 2 * 36e5), l2 = lvl(rt + 2 * 36e5);
+    const trend = lv <= 0 ? "" : lv >= l1 && lv >= l2 && (lv > l1 || lv > l2) ? "\u25B2 local peak" : lv <= l1 && lv <= l2 && (lv < l1 || lv < l2) ? "\u25BC local trough" : l2 > lv ? "\u2191 rising" : "\u2193 falling";
+    const near = injections.map(normalizeInj).find((i) => Math.abs(+new Date(i.datetime) - rt) <= 3 * 36e5);
+    const when = new Date(rt).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }) + " \xB7 " + new Date(rt).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+    return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 10 } }, [7, 30, 90, 180].map((d) => /* @__PURE__ */ React.createElement("button", { key: d, onClick: () => {
+      setCursor(null);
+      onRange(d);
+    }, style: { flex: 1, padding: "6px 0", fontSize: 12, fontWeight: 600, borderRadius: 8, border: "1px solid", fontFamily: "inherit", cursor: "pointer", background: range === d ? "#1e3a5f" : "#0f172a", borderColor: range === d ? "#3b82f6" : "#1e293b", color: range === d ? "#93c5fd" : "#64748b" } }, d, " days"))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 6, minHeight: 56, gap: 10 } }, /* @__PURE__ */ React.createElement("div", { style: { minWidth: 0, flex: 1 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b" } }, cursor === null ? "Now" : when, cursor === null ? ` \xB7 ${when}` : ""), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: trend.includes("peak") ? "#fb923c" : trend.includes("trough") ? "#60a5fa" : "#64748b", marginTop: 2 } }, trend, near ? `${trend ? " \xB7 " : ""}\u{1F489} ${near.compounds.map((c) => `${c.dose}mg ${(COMPOUND_PARAMS[c.name] || {}).label || c.name}`).join(" + ")} at ${new Date(near.datetime).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}` : "")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 26, fontWeight: 700, fontFamily: "'DM Mono', monospace", color: "#e2e8f0", whiteSpace: "nowrap", flexShrink: 0 } }, lv, /* @__PURE__ */ React.createElement("span", { style: { fontSize: 12, fontWeight: 400, color: "#64748b" } }, " ng/dL"))), /* @__PURE__ */ React.createElement(
+      "svg",
+      {
+        ref: svgRef,
+        viewBox: `0 0 ${W} ${H}`,
+        style: { width: "100%", height: "auto", display: "block", touchAction: "pan-y", userSelect: "none", WebkitUserSelect: "none" },
+        onPointerDown: (e) => {
+          try {
+            e.currentTarget.setPointerCapture(e.pointerId);
+          } catch (_) {
+          }
+          pick(e);
+        },
+        onPointerMove: (e) => {
+          if (e.pointerType === "mouse" || e.buttons) pick(e);
+        }
+      },
+      /* @__PURE__ */ React.createElement("defs", null, /* @__PURE__ */ React.createElement("linearGradient", { id: "lvlGrad", x1: "0", y1: "0", x2: "0", y2: "1" }, /* @__PURE__ */ React.createElement("stop", { offset: "0%", stopColor: "#3b82f6", stopOpacity: "0.28" }), /* @__PURE__ */ React.createElement("stop", { offset: "100%", stopColor: "#3b82f6", stopOpacity: "0.02" }))),
+      yticks.map((v) => /* @__PURE__ */ React.createElement("g", { key: v }, /* @__PURE__ */ React.createElement("line", { x1: L, x2: W - R, y1: yOf(v), y2: yOf(v), stroke: "#1e293b", strokeWidth: "1" }), /* @__PURE__ */ React.createElement("text", { x: L - 5, y: yOf(v) + 3, textAnchor: "end", fill: "#475569", fontSize: "9" }, v))),
+      refs.map((v) => /* @__PURE__ */ React.createElement("line", { key: v, x1: L, x2: W - R, y1: yOf(v), y2: yOf(v), stroke: "#f87171", strokeWidth: "1", strokeDasharray: "4 3", opacity: "0.6" })),
+      /* @__PURE__ */ React.createElement("path", { d: area, fill: "url(#lvlGrad)" }),
+      /* @__PURE__ */ React.createElement("path", { d: line, fill: "none", stroke: "#3b82f6", strokeWidth: "2", strokeLinejoin: "round" }),
+      /* @__PURE__ */ React.createElement("line", { x1: xOf(nowMs), x2: xOf(nowMs), y1: T, y2: H - B, stroke: "#94a3b8", strokeWidth: "1", strokeDasharray: "2 3" }),
+      xticks.map((t) => /* @__PURE__ */ React.createElement("text", { key: t, x: xOf(t), y: H - 8, textAnchor: "middle", fill: "#475569", fontSize: "9" }, new Date(t).toLocaleDateString("en-US", { month: "short", day: "numeric" }))),
+      marks.map((t, i) => /* @__PURE__ */ React.createElement("circle", { key: i, cx: xOf(t), cy: yOf(lvl(t)), r: range <= 7 ? 4.5 : 3.5, fill: "#4ade80", stroke: "#0a0d12", strokeWidth: "1.5" })),
+      cursor !== null && /* @__PURE__ */ React.createElement("g", null, /* @__PURE__ */ React.createElement("line", { x1: xOf(cursor), x2: xOf(cursor), y1: T, y2: H - B, stroke: "#e2e8f0", strokeWidth: "1", opacity: "0.8" }), /* @__PURE__ */ React.createElement("circle", { cx: xOf(cursor), cy: yOf(lv), r: "4.5", fill: "#e2e8f0", stroke: "#3b82f6", strokeWidth: "2" }))
+    ), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: "4px 14px", marginTop: 6, fontSize: 10, color: "#64748b" } }, /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 5 } }, /* @__PURE__ */ React.createElement("span", { style: { width: 14, height: 2, background: "#3b82f6", display: "inline-block" } }), "Total T (modeled)"), refs.length > 0 && /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 5 } }, /* @__PURE__ */ React.createElement("span", { style: { width: 14, borderTop: "2px dashed #f87171", display: "inline-block" } }), refs.map((v) => v.toLocaleString()).join(" / "), " ng/dL range limits"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 5 } }, /* @__PURE__ */ React.createElement("span", { style: { width: 0, height: 10, borderLeft: "1px dashed #94a3b8", display: "inline-block" } }), "Now"), showInj && /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 5 } }, /* @__PURE__ */ React.createElement("span", { style: { width: 8, height: 8, borderRadius: "50%", background: "#4ade80", display: "inline-block" } }), "Injection")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginTop: 8, lineHeight: 1.5 } }, pk && tr ? /* @__PURE__ */ React.createElement("span", null, "Last ", range, " days: peak ", /* @__PURE__ */ React.createElement("b", { style: { color: "#e2e8f0" } }, pk[1]), " (", fmtDT(pk[0]), ") \xB7 low ", /* @__PURE__ */ React.createElement("b", { style: { color: "#e2e8f0" } }, tr[1]), " (", fmtDT(tr[0]), ")") : null, /* @__PURE__ */ React.createElement("div", { style: { marginTop: 2, color: "#475569" } }, "Touch and drag across the chart to read any moment. The next day is shown; the Estimate tab covers the future.")));
+  }
   function TRTTracker() {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j;
+    var _a, _b, _c, _d, _e, _f;
     const [activeTab, setActiveTab] = useState("dashboard");
     const [injections, setInjections] = useState([]);
     const [symptoms, setSymptoms] = useState([]);
@@ -517,7 +601,6 @@ react-dom/cjs/react-dom-client.production.js:
     };
     const cal = useMemo(() => computeCalibration(labs, injections), [labs, injections]);
     const scale = settings.autoCalibrate && cal.applied ? cal.k : 1;
-    const pkCurve = useMemo(() => generatePKCurve(injections, scale), [injections, scale]);
     if (!loaded) return /* @__PURE__ */ React.createElement("div", { style: { background: "#0a0d12", minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 16, fontFamily: "'DM Sans', sans-serif", color: "#475569" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 36 } }, "\u26A1"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 14, fontWeight: 500 } }, "Loading your data\u2026"));
     const currentLevel = computeLevel(injections, /* @__PURE__ */ new Date(), scale);
     const latestShbgLab = [...labs].reverse().find((l) => parseFloat(l.values && l.values.shbg) > 0);
@@ -611,41 +694,44 @@ react-dom/cjs/react-dom-client.production.js:
     const nextInjDate = lastInjection ? new Date(new Date(lastInjection.datetime).getTime() + intervalDays * 864e5) : null;
     const levelColor = currentLevel < 300 ? "#f87171" : currentLevel < 500 ? "#fb923c" : currentLevel < 1e3 ? "#4ade80" : "#f87171";
     const levelLabel = currentLevel < 300 ? "Low" : currentLevel < 500 ? "Suboptimal" : currentLevel < 1e3 ? "Optimal" : "High";
-    const nowTime = Date.now();
-    const chartData = pkCurve.filter((p) => p.level >= 0 && p.time >= Date.now() - 60 * 864e5);
     const suggestedSite = rotationOrder.length ? INJECTION_SITES.find((s) => s.id === rotationOrder[rotationIndex % rotationOrder.length]) : null;
     const primaryCompound = protocol.active && ((_b = protocol.compounds) == null ? void 0 : _b[0]) ? protocol.compounds[0] : null;
     const estIntervalDays = (_c = FREQ_DAYS[estFreq]) != null ? _c : 7;
     const estWeeklyDose = Math.round(estDose * (7 / estIntervalDays));
-    const curWeeklyDose = Math.round(((_g = (_f = primaryCompound == null ? void 0 : primaryCompound.dose) != null ? _f : (_e = (_d = lastInjection == null ? void 0 : lastInjection.compounds) == null ? void 0 : _d[0]) == null ? void 0 : _e.dose) != null ? _g : 100) * (7 / intervalDays));
+    const baseCompounds = protocol.active && protocol.compounds && protocol.compounds.length ? protocol.compounds : lastInjection ? lastInjection.compounds : [{ name: "Testosterone Cypionate", dose: 100, concentration: 200 }];
+    const curWeeklyDose = Math.round(baseCompounds.filter((c) => isTCompound(c.name)).reduce((sum, c) => sum + (parseFloat(c.dose) || 0), 0) * (7 / intervalDays));
     const buildComparisonChart = () => {
-      var _a2, _b2;
       const now = /* @__PURE__ */ new Date();
       const end = new Date(now.getTime() + 60 * 864e5);
-      const buildSim = (baseDose, baseEster, baseIntervalDays) => {
+      const buildSim = (simCompounds, baseIntervalDays) => {
         const result = [...injections];
         const last = lastInjection ? new Date(lastInjection.datetime) : now;
         let next = new Date(last.getTime() + baseIntervalDays * 864e5);
         while (next <= end) {
-          result.push({ id: `sim-${next.getTime()}`, datetime: next.toISOString(), compounds: [{ name: baseEster, dose: baseDose, concentration: 200 }] });
+          result.push({ id: `sim-${next.getTime()}`, datetime: next.toISOString(), compounds: simCompounds });
           next = new Date(next.getTime() + baseIntervalDays * 864e5);
         }
         return result;
       };
-      const currentSim = buildSim((_a2 = primaryCompound == null ? void 0 : primaryCompound.dose) != null ? _a2 : 100, (_b2 = primaryCompound == null ? void 0 : primaryCompound.name) != null ? _b2 : "Testosterone Cypionate", intervalDays);
-      const estSim = buildSim(estDose, estEster, estIntervalDays);
+      const currentSim = buildSim(baseCompounds.map((c) => ({ name: c.name, dose: parseFloat(c.dose) || 0, concentration: c.concentration || 200 })), intervalDays);
+      const estSim = buildSim([{ name: estEster, dose: estDose, concentration: 200 }], estIntervalDays);
       const points = [];
-      for (let d = new Date(now); d <= end; d.setHours(d.getHours() + 8)) {
+      for (let d = new Date(now); d <= end; d.setHours(d.getHours() + 4)) {
         const t = new Date(d);
         points.push({ time: +t, label: t.toLocaleDateString("en-US", { month: "short", day: "numeric" }), current: computeLevel(currentSim, t, scale), estimate: computeLevel(estSim, t, scale) });
       }
       return points;
     };
     const compChart = activeTab === "estimate" ? buildComparisonChart() : [];
-    const estPeak = compChart.length ? Math.max(...compChart.map((p) => p.estimate)) : 0;
-    const estTrough = compChart.filter((p) => p.estimate > 0).length ? Math.min(...compChart.filter((p) => p.estimate > 0).map((p) => p.estimate)) : 0;
-    const curPeak = compChart.length ? Math.max(...compChart.map((p) => p.current)) : 0;
-    const curTrough = compChart.filter((p) => p.current > 0).length ? Math.min(...compChart.filter((p) => p.current > 0).map((p) => p.current)) : 0;
+    const steadyStats = (key, interval) => {
+      const endT = compChart.length ? compChart[compChart.length - 1].time : 0;
+      const win = Math.max(14, 2 * interval) * 864e5;
+      const sub = compChart.filter((p) => p.time >= endT - win && p[key] > 0).map((p) => p[key]);
+      return { peak: sub.length ? Math.max(...sub) : 0, trough: sub.length ? Math.min(...sub) : 0 };
+    };
+    const estStats = steadyStats("estimate", estIntervalDays);
+    const curStats = steadyStats("current", intervalDays);
+    const estPeak = estStats.peak, estTrough = estStats.trough, curPeak = curStats.peak, curTrough = curStats.trough;
     const bulkDates = (b) => {
       if (!b.start || !b.end) return [];
       const [sy, sm, sd] = b.start.split("-").map(Number), [ey, em, ed] = b.end.split("-").map(Number);
@@ -739,10 +825,10 @@ react-dom/cjs/react-dom-client.production.js:
       },
       /* @__PURE__ */ React.createElement("span", { style: { fontSize: 16 } }, t.icon),
       t.label
-    ))), /* @__PURE__ */ React.createElement("div", { style: { padding: "16px 16px 100px", overflowY: "auto", maxHeight: "calc(100vh - 140px)" } }, activeTab === "dashboard" && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "#94a3b8" } }, "Testosterone Level Curve"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569" } }, "Next 30 days")), /* @__PURE__ */ React.createElement(SvgAreaChart, { data: chartData, series: [{ key: "level", color: "#3b82f6" }], height: 160, refLines: [300, 1e3], nowTime })), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 14 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 600 } }, "Days Since Inj."), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 28, fontWeight: 700, color: daysSinceLastInj > 8 ? "#f87171" : "#e2e8f0", fontFamily: "'DM Mono', monospace", marginTop: 4 } }, daysSinceLastInj != null ? daysSinceLastInj : "\u2014"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569" } }, lastInjection ? new Date(lastInjection.datetime).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "No injections")), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 14 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 600 } }, "Next Injection"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 16, fontWeight: 700, marginTop: 4 } }, nextInjDate ? nextInjDate.toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "\u2014"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569" } }, protocol.active ? FREQ_LABELS[protocol.frequency] : "Weekly")), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 14 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 600 } }, "Total Injections"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 28, fontWeight: 700, fontFamily: "'DM Mono', monospace", marginTop: 4 } }, injections.length), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569" } }, ((_h = lastInjection == null ? void 0 : lastInjection.compounds) == null ? void 0 : _h.map((c) => {
+    ))), /* @__PURE__ */ React.createElement("div", { style: { padding: "16px 16px 100px", overflowY: "auto", maxHeight: "calc(100vh - 140px)" } }, activeTab === "dashboard" && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "#94a3b8", marginBottom: 10 } }, "Testosterone Level Curve"), /* @__PURE__ */ React.createElement(LevelChart, { injections, scale, range: settings.chartRange || 30, onRange: (d) => setSettings((st) => ({ ...st, chartRange: d })) })), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 14 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 600 } }, "Days Since Inj."), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 28, fontWeight: 700, color: daysSinceLastInj > 8 ? "#f87171" : "#e2e8f0", fontFamily: "'DM Mono', monospace", marginTop: 4 } }, daysSinceLastInj != null ? daysSinceLastInj : "\u2014"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569" } }, lastInjection ? new Date(lastInjection.datetime).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "No injections")), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 14 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 600 } }, "Next Injection"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 16, fontWeight: 700, marginTop: 4 } }, nextInjDate ? nextInjDate.toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "\u2014"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569" } }, protocol.active ? FREQ_LABELS[protocol.frequency] : "Weekly")), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 14 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 600 } }, "Total Injections"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 28, fontWeight: 700, fontFamily: "'DM Mono', monospace", marginTop: 4 } }, injections.length), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569" } }, ((_d = lastInjection == null ? void 0 : lastInjection.compounds) == null ? void 0 : _d.map((c) => {
       var _a2, _b2;
       return `${c.dose}mg ${(_b2 = (_a2 = COMPOUND_PARAMS[c.name]) == null ? void 0 : _a2.label) != null ? _b2 : c.name}`;
-    }).join(" + ")) || "")), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 14 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 600 } }, "Next Site"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 15, fontWeight: 700, marginTop: 4, color: "#4ade80" } }, (_i = suggestedSite == null ? void 0 : suggestedSite.label) != null ? _i : "\u2014"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569" } }, "#", rotationIndex % rotationOrder.length + 1, " in rotation"))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "#94a3b8", marginBottom: 12 } }, "Recent Injections"), injections.slice(-4).reverse().map((raw) => {
+    }).join(" + ")) || "")), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 14 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 600 } }, "Next Site"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 15, fontWeight: 700, marginTop: 4, color: "#4ade80" } }, (_e = suggestedSite == null ? void 0 : suggestedSite.label) != null ? _e : "\u2014"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569" } }, "#", rotationIndex % rotationOrder.length + 1, " in rotation"))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "#94a3b8", marginBottom: 12 } }, "Recent Injections"), injections.slice(-4).reverse().map((raw) => {
       var _a2;
       const inj = normalizeInj(raw);
       return /* @__PURE__ */ React.createElement("div", { key: inj.id, style: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: "1px solid #1e293b" } }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600 } }, inj.compounds.map((c) => {
@@ -759,7 +845,7 @@ react-dom/cjs/react-dom-client.production.js:
         style: { fontSize: 12, padding: "6px 14px", background: protocol.active ? "#1e293b" : "linear-gradient(135deg,#3b82f6,#6366f1)", border: protocol.active ? "1px solid #334155" : "none", color: protocol.active ? "#94a3b8" : "white", borderRadius: 8, cursor: "pointer", fontFamily: "inherit", fontWeight: 600 }
       },
       protocol.active ? "Edit" : "Set Up"
-    )), protocol.active && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } }, (_j = protocol.compounds) == null ? void 0 : _j.map((c, i) => {
+    )), protocol.active && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } }, (_f = protocol.compounds) == null ? void 0 : _f.map((c, i) => {
       var _a2, _b2;
       const params = COMPOUND_PARAMS[c.name] || {};
       return /* @__PURE__ */ React.createElement("div", { key: i, style: { background: "#0f172a", borderRadius: 10, padding: "10px 12px", display: "flex", alignItems: "center", gap: 10 } }, /* @__PURE__ */ React.createElement("div", { style: { width: 10, height: 10, borderRadius: 5, background: params.color || "#3b82f6", flexShrink: 0 } }), /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 14, fontWeight: 700, fontFamily: "'DM Mono', monospace" } }, c.dose, /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: "#64748b", fontWeight: 400 } }, "mg"), " ", /* @__PURE__ */ React.createElement("span", { style: { fontSize: 13, fontWeight: 600, color: "#94a3b8", fontFamily: "inherit" } }, (_a2 = params.label) != null ? _a2 : c.name)), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#475569" } }, (_b2 = c.concentration) != null ? _b2 : 200, "mg/mL \xB7 ", ((c.dose || 0) / (c.concentration || 200)).toFixed(2), "mL")));
@@ -829,7 +915,7 @@ react-dom/cjs/react-dom-client.production.js:
       },
       /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, fontWeight: 600 } }, opt.label),
       /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, opacity: 0.7 } }, opt.sub)
-    ))))), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: "#3b82f6", fontWeight: 700, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 8 } }, "Current"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 2 } }, "Weekly dose"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 16, fontWeight: 700, fontFamily: "'DM Mono', monospace", marginBottom: 8 } }, curWeeklyDose, /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: "#64748b" } }, "mg")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 2 } }, "Est. peak"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 14, fontWeight: 600, color: curPeak > 1e3 ? "#f87171" : "#4ade80", marginBottom: 6 } }, curPeak, " ", /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: "#64748b" } }, "ng/dL")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 2 } }, "Est. trough"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 14, fontWeight: 600, color: curTrough < 300 ? "#f87171" : curTrough < 500 ? "#fb923c" : "#4ade80" } }, curTrough, " ", /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: "#64748b" } }, "ng/dL"))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 12, borderColor: "#6366f1" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: "#a78bfa", fontWeight: 700, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 8 } }, "Simulated"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 2 } }, "Weekly dose"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 16, fontWeight: 700, fontFamily: "'DM Mono', monospace", marginBottom: 8 } }, estWeeklyDose, /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: "#64748b" } }, "mg")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 2 } }, "Est. peak"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 14, fontWeight: 600, color: estPeak > 1e3 ? "#f87171" : "#4ade80", marginBottom: 6 } }, estPeak, " ", /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: "#64748b" } }, "ng/dL")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 2 } }, "Est. trough"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 14, fontWeight: 600, color: estTrough < 300 ? "#f87171" : estTrough < 500 ? "#fb923c" : "#4ade80" } }, estTrough, " ", /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: "#64748b" } }, "ng/dL")))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 700 } }, "60-Day Projection"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 12, fontSize: 11 } }, /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement("span", { style: { width: 10, height: 2, background: "#3b82f6", display: "inline-block", borderRadius: 1 } }), "Current"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement("span", { style: { width: 10, height: 2, background: "#a78bfa", display: "inline-block", borderRadius: 1 } }), "Simulated"))), /* @__PURE__ */ React.createElement(SvgAreaChart, { data: compChart, series: [{ key: "current", color: "#3b82f6" }, { key: "estimate", color: "#a78bfa", dash: true }], height: 200, refLines: [300, 1e3] })), (() => {
+    ))))), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } }, /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: "#3b82f6", fontWeight: 700, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 8 } }, "Current"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 2 } }, "Weekly dose"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 16, fontWeight: 700, fontFamily: "'DM Mono', monospace", marginBottom: 8 } }, curWeeklyDose, /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: "#64748b" } }, "mg")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 2 } }, "Est. peak (steady state)"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 14, fontWeight: 600, color: curPeak > 1e3 ? "#f87171" : "#4ade80", marginBottom: 6 } }, curPeak, " ", /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: "#64748b" } }, "ng/dL")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 2 } }, "Est. trough (steady state)"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 14, fontWeight: 600, color: curTrough < 300 ? "#f87171" : curTrough < 500 ? "#fb923c" : "#4ade80" } }, curTrough, " ", /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: "#64748b" } }, "ng/dL"))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 12, borderColor: "#6366f1" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: "#a78bfa", fontWeight: 700, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 8 } }, "Simulated"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 2 } }, "Weekly dose"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 16, fontWeight: 700, fontFamily: "'DM Mono', monospace", marginBottom: 8 } }, estWeeklyDose, /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: "#64748b" } }, "mg")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 2 } }, "Est. peak (steady state)"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 14, fontWeight: 600, color: estPeak > 1e3 ? "#f87171" : "#4ade80", marginBottom: 6 } }, estPeak, " ", /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: "#64748b" } }, "ng/dL")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 2 } }, "Est. trough (steady state)"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 14, fontWeight: 600, color: estTrough < 300 ? "#f87171" : estTrough < 500 ? "#fb923c" : "#4ade80" } }, estTrough, " ", /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10, color: "#64748b" } }, "ng/dL")))), /* @__PURE__ */ React.createElement("div", { className: "card", style: { padding: 16 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 700 } }, "60-Day Projection"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 12, fontSize: 11 } }, /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement("span", { style: { width: 10, height: 2, background: "#3b82f6", display: "inline-block", borderRadius: 1 } }), "Current"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement("span", { style: { width: 10, height: 2, background: "#a78bfa", display: "inline-block", borderRadius: 1 } }), "Simulated"))), /* @__PURE__ */ React.createElement(SvgAreaChart, { data: compChart, series: [{ key: "current", color: "#3b82f6" }, { key: "estimate", color: "#a78bfa", dash: true }], height: 200, refLines: [300, 1e3] }), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: "4px 14px", marginTop: 6, fontSize: 10, color: "#64748b" } }, /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 5 } }, /* @__PURE__ */ React.createElement("span", { style: { width: 14, height: 2, background: "#3b82f6", display: "inline-block" } }), "Current protocol"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 5 } }, /* @__PURE__ */ React.createElement("span", { style: { width: 14, borderTop: "2px dashed #a78bfa", display: "inline-block" } }), "Simulated"), /* @__PURE__ */ React.createElement("span", { style: { display: "flex", alignItems: "center", gap: 5 } }, /* @__PURE__ */ React.createElement("span", { style: { width: 14, borderTop: "2px dashed #f87171", display: "inline-block" } }), "300 / 1,000 ng/dL range limits"))), (() => {
       const diff = estWeeklyDose - curWeeklyDose;
       const msgs = [];
       if (estPeak > 1e3) msgs.push({ icon: "\u26A0\uFE0F", text: `Peak of ${estPeak} ng/dL exceeds 1000 ng/dL \u2014 consider reducing dose.`, color: "#f87171" });
